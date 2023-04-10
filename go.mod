@@ -4,7 +4,7 @@ go 1.16
 
 require (
 	github.com/alexedwards/scs v1.4.1
-	github.com/bradleyfalzon/ghinstallation/v2 v2.0.4
+	github.com/bradleyfalzon/ghinstallation/v2 v2.3.0
 	github.com/google/go-github/v41 v41.0.0
 	github.com/gregjones/httpcache v0.0.0-20190611155906-901d90724c79
 	github.com/hashicorp/golang-lru v0.5.4
@@ -15,6 +15,6 @@ require (
 	github.com/shurcooL/githubv4 v0.0.0-20220115235240-a14260e6f8a2
 	github.com/shurcooL/graphql v0.0.0-20181231061246-d48a9a75455f // indirect
 	goji.io v2.0.2+incompatible
-	golang.org/x/oauth2 v0.0.0-20210113205817-d3ed898aa8a3
+	golang.org/x/oauth2 v0.6.0
 	gopkg.in/yaml.v2 v2.4.0
 )
