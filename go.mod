@@ -15,6 +15,6 @@ require (
 	github.com/shurcooL/githubv4 v0.0.0-20220115235240-a14260e6f8a2
 	github.com/shurcooL/graphql v0.0.0-20181231061246-d48a9a75455f // indirect
 	goji.io v2.0.2+incompatible
-	golang.org/x/oauth2 v0.0.0-20210113205817-d3ed898aa8a3
+	golang.org/x/oauth2 v0.7.0
 	gopkg.in/yaml.v2 v2.4.0
 )
