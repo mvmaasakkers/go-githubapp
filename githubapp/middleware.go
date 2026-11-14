@@ -18,11 +18,9 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/gregjones/httpcache"
 	"github.com/rcrowley/go-metrics"
-	"github.com/rs/zerolog"
 )
 
 const (
@@ -36,6 +34,8 @@ const (
 
 	MetricsKeyRateLimit          = "github.rate.limit"
 	MetricsKeyRateLimitRemaining = "github.rate.remaining"
+	MetricsKeyRateLimitUsed      = "github.rate.used"
+	MetricsKeyRateLimitReset     = "github.rate.reset"
 )
 
 // ClientMetrics creates client middleware that records metrics about all
@@ -75,10 +75,15 @@ func ClientMetrics(registry metrics.Registry) ClientMiddleware {
 
 				limitMetric := fmt.Sprintf("%s[installation:%d]", MetricsKeyRateLimit, installationID)
 				remainingMetric := fmt.Sprintf("%s[installation:%d]", MetricsKeyRateLimitRemaining, installationID)
+				usedMetric := fmt.Sprintf("%s[installation:%d]", MetricsKeyRateLimitUsed, installationID)
+				resetMetric := fmt.Sprintf("%s[installation:%d]", MetricsKeyRateLimitReset, installationID)
 
 				// Headers from https://developer.github.com/v3/#rate-limiting
-				updateRegistryForHeader(res.Header, "X-RateLimit-Limit", metrics.GetOrRegisterGauge(limitMetric, registry))
-				updateRegistryForHeader(res.Header, "X-RateLimit-Remaining", metrics.GetOrRegisterGauge(remainingMetric, registry))
+				updateRegistryForHeader(res.Header, httpHeaderRateLimit, metrics.GetOrRegisterGauge(limitMetric, registry))
+				updateRegistryForHeader(res.Header, httpHeaderRateRemaining, metrics.GetOrRegisterGauge(remainingMetric, registry))
+				updateRegistryForHeader(res.Header, httpHeaderRateUsed, metrics.GetOrRegisterGauge(usedMetric, registry))
+				updateRegistryForHeader(res.Header, httpHeaderRateReset, metrics.GetOrRegisterGauge(resetMetric, registry))
+				// TODO Think about to add X-Ratelimit-Resource as well
 			}
 
 			return res, err
@@ -108,40 +113,6 @@ func bucketStatus(status int) string {
 		return MetricsKeyRequests5xx
 	}
 	return ""
-}
-
-// ClientLogging creates client middleware that logs request and response
-// information at the given level. If the request fails without creating a
-// response, it is logged with a status code of -1. The middleware uses a
-// logger from the request context.
-func ClientLogging(lvl zerolog.Level) ClientMiddleware {
-	return func(next http.RoundTripper) http.RoundTripper {
-		return roundTripperFunc(func(r *http.Request) (*http.Response, error) {
-			start := time.Now()
-			res, err := next.RoundTrip(r)
-			elapsed := time.Now().Sub(start)
-
-			evt := zerolog.Ctx(r.Context()).
-				WithLevel(lvl).
-				Str("method", r.Method).
-				Str("path", r.URL.String()).
-				Dur("elapsed", elapsed)
-
-			if res != nil {
-				cached := res.Header.Get(httpcache.XFromCache) != ""
-				evt.Int("status", res.StatusCode).
-					Int64("size", res.ContentLength).
-					Bool("cached", cached)
-			} else {
-				evt.Int("status", -1).
-					Int64("size", -1).
-					Bool("cached", false)
-			}
-
-			evt.Msg("github_request")
-			return res, err
-		})
-	}
 }
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)

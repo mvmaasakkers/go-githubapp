@@ -16,11 +16,10 @@ package githubapp
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"sync/atomic"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/rcrowley/go-metrics"
 	"github.com/rs/zerolog"
 )
@@ -57,8 +56,10 @@ func (d Dispatch) Execute(ctx context.Context) error {
 }
 
 // AsyncErrorCallback is called by an asynchronous scheduler when an event
-// handler returns an error. The error from the handler is passed directly as
-// the final argument.
+// handler returns an error or panics. The error from the handler is passed
+// directly as the final argument.
+//
+// If the handler panics, err will be a HandlerPanicError.
 type AsyncErrorCallback func(ctx context.Context, d Dispatch, err error)
 
 // DefaultAsyncErrorCallback logs errors.
@@ -74,22 +75,6 @@ func MetricsAsyncErrorCallback(reg metrics.Registry) AsyncErrorCallback {
 		zerolog.Ctx(ctx).Error().Err(err).Msg("Unexpected error handling webhook")
 		errorCounter(reg, d.EventType).Inc(1)
 	}
-}
-
-// ContextDeriver creates a new independent context from a request's context.
-// The new context must be based on context.Background(), not the input.
-type ContextDeriver func(context.Context) context.Context
-
-// DefaultContextDeriver copies the logger from the request's context to a new
-// context.
-func DefaultContextDeriver(ctx context.Context) context.Context {
-	newCtx := context.Background()
-
-	// this value is always unused by async schedulers, but is set for
-	// compatibility with existing handlers that call SetResponder
-	newCtx = InitializeResponder(newCtx)
-
-	return zerolog.Ctx(ctx).WithContext(newCtx)
 }
 
 // Scheduler is a strategy for executing event handlers.
@@ -119,16 +104,6 @@ func WithAsyncErrorCallback(onError AsyncErrorCallback) SchedulerOption {
 	}
 }
 
-// WithContextDeriver sets the context deriver for an asynchronous scheduler.
-// If not set, the scheduler uses DefaultContextDeriver.
-func WithContextDeriver(deriver ContextDeriver) SchedulerOption {
-	return func(s *scheduler) {
-		if deriver != nil {
-			s.deriver = deriver
-		}
-	}
-}
-
 // WithSchedulingMetrics enables metrics reporting for schedulers.
 func WithSchedulingMetrics(r metrics.Registry) SchedulerOption {
 	return func(s *scheduler) {
@@ -154,7 +129,6 @@ type queueDispatch struct {
 // core functionality and options for (async) schedulers
 type scheduler struct {
 	onError AsyncErrorCallback
-	deriver ContextDeriver
 
 	activeWorkers int64
 	queue         chan queueDispatch
@@ -168,10 +142,9 @@ func (s *scheduler) safeExecute(ctx context.Context, d Dispatch) {
 	defer func() {
 		atomic.AddInt64(&s.activeWorkers, -1)
 		if r := recover(); r != nil {
-			if rerr, ok := r.(error); ok {
-				err = rerr
-			} else {
-				err = fmt.Errorf("%v", r)
+			err = HandlerPanicError{
+				value: r,
+				stack: getStack(1),
 			}
 		}
 		if err != nil && s.onError != nil {
@@ -181,13 +154,6 @@ func (s *scheduler) safeExecute(ctx context.Context, d Dispatch) {
 
 	atomic.AddInt64(&s.activeWorkers, 1)
 	err = d.Execute(ctx)
-}
-
-func (s *scheduler) derive(ctx context.Context) context.Context {
-	if s.deriver == nil {
-		return ctx
-	}
-	return s.deriver(ctx)
 }
 
 // DefaultScheduler returns a scheduler that executes handlers in the go
@@ -207,7 +173,6 @@ func (s *defaultScheduler) Schedule(ctx context.Context, d Dispatch) error {
 func AsyncScheduler(opts ...SchedulerOption) Scheduler {
 	s := &asyncScheduler{
 		scheduler: scheduler{
-			deriver: DefaultContextDeriver,
 			onError: DefaultAsyncErrorCallback,
 		},
 	}
@@ -222,7 +187,7 @@ type asyncScheduler struct {
 }
 
 func (s *asyncScheduler) Schedule(ctx context.Context, d Dispatch) error {
-	go s.safeExecute(s.derive(ctx), d)
+	go s.safeExecute(context.WithoutCancel(ctx), d)
 	return nil
 }
 
@@ -239,7 +204,6 @@ func QueueAsyncScheduler(queueSize int, workers int, opts ...SchedulerOption) Sc
 
 	s := &queueScheduler{
 		scheduler: scheduler{
-			deriver: DefaultContextDeriver,
 			onError: DefaultAsyncErrorCallback,
 			queue:   make(chan queueDispatch, queueSize),
 		},
@@ -248,7 +212,7 @@ func QueueAsyncScheduler(queueSize int, workers int, opts ...SchedulerOption) Sc
 		opt(&s.scheduler)
 	}
 
-	for i := 0; i < workers; i++ {
+	for range workers {
 		go func() {
 			for d := range s.queue {
 				if s.eventAge != nil {
@@ -268,7 +232,7 @@ type queueScheduler struct {
 
 func (s *queueScheduler) Schedule(ctx context.Context, d Dispatch) error {
 	select {
-	case s.queue <- queueDispatch{ctx: s.derive(ctx), t: time.Now(), d: d}:
+	case s.queue <- queueDispatch{ctx: context.WithoutCancel(ctx), t: time.Now(), d: d}:
 	default:
 		if s.dropped != nil {
 			s.dropped.Inc(1)

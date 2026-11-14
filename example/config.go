@@ -15,19 +15,23 @@
 package main
 
 import (
-	"io/ioutil"
+	"fmt"
+	"os"
 
-	"github.com/palantir/go-baseapp/baseapp"
 	"github.com/palantir/go-githubapp/githubapp"
-	"github.com/pkg/errors"
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v4"
 )
 
 type Config struct {
-	Server baseapp.HTTPConfig `yaml:"server"`
-	Github githubapp.Config   `yaml:"github"`
+	Server HTTPConfig       `yaml:"server"`
+	Github githubapp.Config `yaml:"github"`
 
 	AppConfig MyApplicationConfig `yaml:"app_configuration"`
+}
+
+type HTTPConfig struct {
+	Address string `yaml:"address"`
+	Port    int    `yaml:"port"`
 }
 
 type MyApplicationConfig struct {
@@ -37,13 +41,13 @@ type MyApplicationConfig struct {
 func ReadConfig(path string) (*Config, error) {
 	var c Config
 
-	bytes, err := ioutil.ReadFile(path)
+	bytes, err := os.ReadFile(path)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed reading server config file: %s", path)
+		return nil, fmt.Errorf("failed reading server config file: %s: %w", path, err)
 	}
 
-	if err := yaml.UnmarshalStrict(bytes, &c); err != nil {
-		return nil, errors.Wrap(err, "failed parsing configuration file")
+	if err := yaml.Load(bytes, &c, yaml.WithV2Defaults(), yaml.WithKnownFields()); err != nil {
+		return nil, fmt.Errorf("failed parsing configuration file: %w", err)
 	}
 
 	return &c, nil

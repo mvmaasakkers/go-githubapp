@@ -1,3 +1,7 @@
+<p align="right">
+<a href="https://autorelease.general.dmz.palantir.tech/palantir/go-githubapp"><img src="https://img.shields.io/badge/Perform%20an-Autorelease-success.svg" alt="Autorelease"></a>
+</p>
+
 # go-githubapp [![GoDoc](https://godoc.org/github.com/palantir/go-githubapp?status.svg)](http://godoc.org/github.com/palantir/go-githubapp)
 
 A library for building [GitHub Apps](https://developer.github.com/apps/) and
@@ -63,6 +67,10 @@ func registerRoutes(c githubapp.Config) {
 }
 ```
 
+We recommend using [go-baseapp](https://github.com/palantir/go-baseapp) as the minimal server
+framework for writing github apps, though go-githubapp works well with the standard library and 
+can be easily integrated into most existing frameworks.
+
 ### Examples
 
 The [example package](example/main.go) contains a fully functional server
@@ -72,7 +80,6 @@ commenting with a copy of the comment body.
 To run the app, update `example/config.yml` with appropriate secrets and then
 run:
 
-    ./godelw dep
     ./godelw run example
 
 ### Dependencies
@@ -264,7 +271,11 @@ func getOrganizationClient(cc githubapp.ClientCreator, org string) (*github.Clie
 
     // look up the installation ID for a particular organization
     installations := githubapp.NewInstallationsService(appClient)
-    install := installations.GetByOwner(context.Background(), org)
+
+    install, err := installations.GetByOwner(context.Background(), org)
+    if err != nil {
+        return nil, err
+    }
 
     // create a client to perform actions on that specific organization
     return cc.NewInstallationClient(install.ID)
@@ -320,6 +331,22 @@ func loadConfig(ctx context.Context, client *github.Client, owner, repo, ref str
     return &appConfig, nil
 }
 ```
+
+To load a specific remote file without discovery or remote-reference parsing, use
+`LoadRemoteRef`. Missing files are errors; existing empty files retain their
+source metadata.
+
+```go
+c, err := loader.LoadRemoteRef(ctx, client, clientOwner, appconfig.RemoteRef{
+    Remote: "example/shared-config",
+    Path:   "config/app.yml",
+    Ref:    "main",
+})
+```
+
+`clientOwner` must be the supplied client's original installation owner, even if
+an earlier load returned a file owned by another organization. Using another
+owner's installation requires `appconfig.WithPrivateRemotes`.
 
 ## OAuth2
 

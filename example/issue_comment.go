@@ -20,9 +20,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/google/go-github/v41/github"
+	"github.com/google/go-github/v93/github"
 	"github.com/palantir/go-githubapp/githubapp"
-	"github.com/pkg/errors"
 	"github.com/rs/zerolog"
 )
 
@@ -39,7 +38,7 @@ func (h *PRCommentHandler) Handles() []string {
 func (h *PRCommentHandler) Handle(ctx context.Context, eventType, deliveryID string, payload []byte) error {
 	var event github.IssueCommentEvent
 	if err := json.Unmarshal(payload, &event); err != nil {
-		return errors.Wrap(err, "failed to parse issue comment event payload")
+		return fmt.Errorf("failed to parse issue comment event payload: %w", err)
 	}
 
 	if !event.GetIssue().IsPullRequest() {
@@ -75,11 +74,11 @@ func (h *PRCommentHandler) Handle(ctx context.Context, eventType, deliveryID str
 
 	logger.Debug().Msgf("Echoing comment on %s/%s#%d by %s", repoOwner, repoName, prNum, author)
 	msg := fmt.Sprintf("%s\n%s said\n```\n%s\n```\n", h.preamble, author, body)
-	prComment := github.IssueComment{
-		Body: &msg,
+	prComment := github.IssueCommentRequest{
+		Body: msg,
 	}
 
-	if _, _, err := client.Issues.CreateComment(ctx, repoOwner, repoName, prNum, &prComment); err != nil {
+	if _, _, err := client.Issues.CreateComment(ctx, repoOwner, repoName, prNum, prComment); err != nil {
 		logger.Error().Err(err).Msg("Failed to comment on pull request")
 	}
 

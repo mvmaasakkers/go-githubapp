@@ -20,13 +20,14 @@ package appconfig
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"strings"
 
-	"github.com/google/go-github/v41/github"
-	"github.com/pkg/errors"
+	"github.com/google/go-github/v93/github"
+	"github.com/palantir/go-githubapp/githubapp"
 	"github.com/rs/zerolog"
 )
 
@@ -52,7 +53,7 @@ type RemoteRef struct {
 func (r RemoteRef) SplitRemote() (owner, repo string, err error) {
 	slash := strings.IndexByte(r.Remote, '/')
 	if slash <= 0 || slash >= len(r.Remote)-1 {
-		return "", "", errors.Errorf("invalid remote value: %s", r.Remote)
+		return "", "", fmt.Errorf("invalid remote value: %s", r.Remote)
 	}
 	return r.Remote[:slash], r.Remote[slash+1:], nil
 }
@@ -81,6 +82,9 @@ type Loader struct {
 	parser       RemoteRefParser
 	defaultRepo  string
 	defaultPaths []string
+
+	clientCreator githubapp.ClientCreator
+	installations githubapp.InstallationsService
 }
 
 // NewLoader creates a Loader that loads configuration from paths.
@@ -139,7 +143,7 @@ func (ld *Loader) LoadConfig(ctx context.Context, client *github.Client, owner, 
 			}
 			if remote != nil {
 				logger.Debug().Msgf("Found remote configuration at %s in %s", p, c.Source)
-				return ld.loadRemoteConfig(ctx, client, *remote, c)
+				return ld.loadRemoteConfig(ctx, client, owner, *remote, c)
 			}
 		}
 
@@ -159,7 +163,17 @@ func (ld *Loader) LoadConfig(ctx context.Context, client *github.Client, owner, 
 	return Config{}, nil
 }
 
-func (ld *Loader) loadRemoteConfig(ctx context.Context, client *github.Client, remote RemoteRef, c Config) (Config, error) {
+// LoadRemoteRef loads the file identified by remote. Unlike LoadConfig, it
+// does not follow remote references, try other paths, or fall back to owner
+// defaults. A missing file is an error.
+//
+// clientOwner is the owner of the installation for that client.
+// It determines whether WithPrivateRemotes selects a different installation.
+func (ld *Loader) LoadRemoteRef(ctx context.Context, client *github.Client, clientOwner string, remote RemoteRef) (Config, error) {
+	return ld.loadRemoteConfig(ctx, client, clientOwner, remote, Config{})
+}
+
+func (ld *Loader) loadRemoteConfig(ctx context.Context, client *github.Client, sourceOwner string, remote RemoteRef, c Config) (Config, error) {
 	logger := zerolog.Ctx(ctx)
 	notFoundErr := fmt.Errorf("invalid remote reference: file does not exist")
 
@@ -167,6 +181,7 @@ func (ld *Loader) loadRemoteConfig(ctx context.Context, client *github.Client, r
 	if err != nil {
 		return c, err
 	}
+	client = ld.remoteClient(ctx, client, sourceOwner, owner, repo)
 
 	path := remote.Path
 	if path == "" && len(ld.paths) > 0 {
@@ -189,7 +204,7 @@ func (ld *Loader) loadRemoteConfig(ctx context.Context, client *github.Client, r
 			if isNotFound(err) {
 				return c, notFoundErr
 			}
-			return c, errors.Wrap(err, "failed to get remote repository")
+			return c, fmt.Errorf("failed to get remote repository: %w", err)
 		}
 		ref = r.GetDefaultBranch()
 	}
@@ -222,7 +237,7 @@ func (ld *Loader) loadDefaultConfig(ctx context.Context, client *github.Client, 
 			return Config{}, nil
 		}
 		c := Config{Source: fmt.Sprintf("%s/%s", owner, ld.defaultRepo)}
-		return c, errors.Wrap(err, "failed to get default repository")
+		return c, fmt.Errorf("failed to get default repository: %w", err)
 	}
 
 	ref := r.GetDefaultBranch()
@@ -250,7 +265,7 @@ func (ld *Loader) loadDefaultConfig(ctx context.Context, client *github.Client, 
 			}
 			if remote != nil {
 				logger.Debug().Msgf("Found remote default configuration at %s in %s", p, c.Source)
-				return ld.loadRemoteConfig(ctx, client, *remote, c)
+				return ld.loadRemoteConfig(ctx, client, owner, *remote, c)
 			}
 		}
 
@@ -264,75 +279,93 @@ func (ld *Loader) loadDefaultConfig(ctx context.Context, client *github.Client, 
 	return Config{}, nil
 }
 
+// remoteClient returns an installation-scoped client for remoteOwner/remoteRepo when
+// private remotes are enabled and the remote belongs to a different owner. If
+// the app is not installed on that repository, or a client cannot be created, it
+// falls back to the caller's client so public repositories continue to work.
+func (ld *Loader) remoteClient(ctx context.Context, client *github.Client, sourceOwner, remoteOwner, remoteRepo string) *github.Client {
+	if strings.EqualFold(sourceOwner, remoteOwner) || ld.clientCreator == nil || ld.installations == nil {
+		return client
+	}
+
+	logger := zerolog.Ctx(ctx)
+	installation, err := ld.installations.GetByRepository(ctx, remoteOwner, remoteRepo)
+	if err != nil {
+		logger.Warn().Err(err).Msgf("Failed to find GitHub App installation for remote configuration repository %q; using the original client", remoteOwner+"/"+remoteRepo)
+		return client
+	}
+
+	remoteClient, err := ld.clientCreator.NewInstallationClient(installation.ID)
+	if err != nil {
+		logger.Warn().Err(err).Msgf("Failed to create GitHub App client for remote configuration repository %q; using the original client", remoteOwner+"/"+remoteRepo)
+		return client
+	}
+	return remoteClient
+}
+
 // getFileContents returns the content of the file at path on ref in owner/repo
 // if it exists. Returns an empty slice and false if the file does not exist.
 func getFileContents(ctx context.Context, client *github.Client, owner, repo, ref, path string) ([]byte, bool, error) {
+	// GetContents returns encoded content for files < 1MB and a download URL
+	// for files between 1MB and 100MB. It returns an error for files >100MB,
+	// but if an app has a configuration file that large, there are probably
+	// other issues...
 	file, _, _, err := client.Repositories.GetContents(ctx, owner, repo, path, &github.RepositoryContentGetOptions{
 		Ref: ref,
 	})
 	if err != nil {
-		switch {
-		case isNotFound(err):
+		if isNotFound(err) {
 			return nil, false, nil
-		case isTooLargeError(err):
-			b, err := getLargeFileContents(ctx, client, owner, repo, ref, path)
-			return b, true, err
 		}
-		return nil, false, errors.Wrap(err, "failed to read file")
+		return nil, false, fmt.Errorf("failed to read file: %w", err)
 	}
 
-	// file will be nil if the path exists but is a directory
+	// The file will be nil if the path exists but is a directory
 	if file == nil {
 		return nil, false, nil
 	}
 
+	// If decoding the content fails, ignore the error and try the download URL
+	// instead. The most likely error is if the file is larger than 1MB.
 	content, err := file.GetContent()
-	if err != nil {
-		return nil, true, errors.Wrap(err, "failed to decode file content")
+	if err == nil {
+		return []byte(content), true, nil
 	}
 
-	return []byte(content), true, nil
-}
-
-// getLargeFileContents is similar to getFileContents, but works for files up
-// to 100MB. Unlike getFileContents, it returns an error if the file does not
-// exist.
-func getLargeFileContents(ctx context.Context, client *github.Client, owner, repo, ref, path string) ([]byte, error) {
-	body, res, err := client.Repositories.DownloadContents(ctx, owner, repo, path, &github.RepositoryContentGetOptions{
-		Ref: ref,
-	})
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to read file")
+	downloadURL := file.GetDownloadURL()
+	if downloadURL == "" {
+		return nil, true, errors.New("download url is empty")
 	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
+	if err != nil {
+		return nil, true, fmt.Errorf("failed to create download request: %w", err)
+	}
+
+	res, err := client.Client().Do(req)
+	if err != nil {
+		return nil, true, fmt.Errorf("failed to download file: %w", err)
+	}
+
 	defer func() {
-		_ = body.Close()
+		_, _ = io.Copy(io.Discard, res.Body)
+		_ = res.Body.Close()
 	}()
 
 	if res.StatusCode != http.StatusOK {
-		return nil, errors.Errorf("failed to read file: unexpected status code %d", res.StatusCode)
+		return nil, true, fmt.Errorf("failed to download file: unexpected status code %d", res.StatusCode)
 	}
 
-	b, err := ioutil.ReadAll(body)
+	b, err := io.ReadAll(res.Body)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to read file")
+		return nil, true, fmt.Errorf("failed to read file: %w", err)
 	}
-	return b, nil
+	return b, true, nil
 }
 
 func isNotFound(err error) bool {
 	if rerr, ok := err.(*github.ErrorResponse); ok {
 		return rerr.Response.StatusCode == http.StatusNotFound
-	}
-	return false
-}
-
-func isTooLargeError(err error) bool {
-	if rerr, ok := err.(*github.ErrorResponse); ok {
-		for _, err := range rerr.Errors {
-			if err.Code == "too_large" {
-				return true
-			}
-		}
 	}
 	return false
 }
